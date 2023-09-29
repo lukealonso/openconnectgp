@@ -24,6 +24,20 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#ifndef _WIN32
+#include <pwd.h>
+#include <sys/inotify.h>
+#endif
+
+#define MAX_EVENTS 2
+#define LEN_NAME 32
+#define EVENT_SIZE  ( sizeof (struct inotify_event) ) /*size of one event*/
+#define BUF_LEN     ( MAX_EVENTS * ( EVENT_SIZE + LEN_NAME ))
+
+#define GP_DATA_FILE "globalprotect.dat"
 
 struct login_context {
 	char *username;				/* Username that has already succeeded in some form */
@@ -31,6 +45,7 @@ struct login_context {
 	char *portal_userauthcookie;		/* portal-userauthcookie (from global-protect/getconfig.esp) */
 	char *portal_prelogonuserauthcookie;	/* portal-prelogonuserauthcookie (from global-protect/getconfig.esp) */
 	struct oc_auth_form *form;
+	int cas_auth;				/* Flag indicating whether cas auth is to be used */
 };
 
 void gpst_common_headers(struct openconnect_info *vpninfo,
@@ -59,6 +74,32 @@ const char *gpst_os_name(struct openconnect_info *vpninfo)
 		return "Windows";
 }
 
+static char *get_user_cache_dir(void)
+{
+	char *cache_dir;
+	int cache_dir_len;
+#ifndef _WIN32
+	struct passwd *pw = getpwuid(getuid());
+	char *home = strdup(pw->pw_dir);
+#else
+	/* TODO: Add WIN32 implementation */
+	char *home = strdup("");
+#endif
+
+	/* Ensure that the openconnect cache dir exists */
+	cache_dir_len = strlen(home) + strlen("/.cache/openconnect/") + 1;
+	cache_dir = malloc(cache_dir_len);
+	snprintf(cache_dir, cache_dir_len, "%s/.cache/openconnect/", home);
+	free(home);
+
+#ifndef _WIN32
+	mkdir(cache_dir, 0700);
+#else
+	CreateDirectory(cache_dir, NULL);
+#endif
+
+	return cache_dir;
+}
 
 /* Parse pre-login response ({POST,GET} /{global-protect,ssl-vpn}/pre-login.esp)
  *
@@ -81,17 +122,29 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	char *prompt = NULL, *username_label = NULL, *password_label = NULL;
 	char *s = NULL, *saml_method = NULL, *saml_path = NULL;
 	int result = -EINVAL;
+	int default_browser = 0;
+	int cas_auth = 0;
 
 	if (!xmlnode_is_named(xml_node, "prelogin-response"))
 		goto out;
 
 	for (xml_node = xml_node->children; xml_node; xml_node = xml_node->next) {
+		if (xmlnode_is_named(xml_node, "saml-default-browser"))
+			default_browser = xmlnode_bool_or_int_value(xml_node);
+		if (xmlnode_is_named(xml_node, "cas-auth"))
+			cas_auth = xmlnode_bool_or_int_value(xml_node);
+
 		xmlnode_get_val(xml_node, "saml-request", &s);
 		xmlnode_get_val(xml_node, "saml-auth-method", &saml_method);
 		xmlnode_get_trimmed_val(xml_node, "authentication-message", &prompt);
 		xmlnode_get_trimmed_val(xml_node, "username-label", &username_label);
 		xmlnode_get_trimmed_val(xml_node, "password-label", &password_label);
 		/* XX: should we save the certificate username from <ccusername/> ? */
+	}
+
+	if (default_browser != 0) {
+		vpn_progress(vpninfo, PRG_INFO, "Using default browser\n");
+		ctx->cas_auth = cas_auth;
 	}
 
 	if (saml_method && s) {
@@ -638,8 +691,8 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 		}
 		if (!keep_urlpath) {
 			orig_path = vpninfo->urlpath;
-			if (asprintf(&vpninfo->urlpath, "%s/prelogin.esp?tmp=tmp&clientVer=4100&clientos=%s",
-				     portal ? "global-protect" : "ssl-vpn", gpst_os_name(vpninfo)) < 0) {
+			if (asprintf(&vpninfo->urlpath, "%s/prelogin.esp?tmp=tmp&clientVer=4100&clientos=%s&default-browser=4&cas-support=yes",
+				portal ? "global-protect" : "ssl-vpn", gpst_os_name(vpninfo)) < 0) {
 				result = -ENOMEM;
 				goto out;
 			}
@@ -656,7 +709,7 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 		if (result)
 			goto out;
 
-	got_form:
+		got_form:
 		/* process auth form */
 		result = process_auth_form(vpninfo, ctx->form);
 		if (result)
@@ -671,7 +724,7 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 				goto out;
 		}
 
-	replay_form:
+		replay_form:
 		/* generate token code if specified */
 		result = do_gen_tokencode(vpninfo, ctx->form);
 		if (result) {
@@ -688,6 +741,8 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 		append_opt(request_body, "os-version", vpninfo->platname);
 		append_opt(request_body, "server", vpninfo->hostname);
 		append_opt(request_body, "computer", vpninfo->localname);
+		if (ctx->cas_auth && vpninfo->sso_token_cookie)
+			append_opt(request_body, "token", vpninfo->sso_token_cookie);
 		if (ctx->portal_userauthcookie)
 			append_opt(request_body, "portal-userauthcookie", ctx->portal_userauthcookie);
 		if (ctx->portal_prelogonuserauthcookie)
@@ -697,9 +752,11 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 			append_opt(request_body, "preferred-ip", vpninfo->ip_info.addr);
 		if (vpninfo->ip_info.addr6)
 			append_opt(request_body, "preferred-ipv6", vpninfo->ip_info.addr);
-		if (ctx->form->action)
-			append_opt(request_body, "inputStr", ctx->form->action);
-		append_form_opts(vpninfo, ctx->form, request_body);
+		if (ctx->form) {
+			if (ctx->form->action)
+				append_opt(request_body, "inputStr", ctx->form->action);
+			append_form_opts(vpninfo, ctx->form, request_body);
+		}
 		if ((result = buf_error(request_body)))
 			goto out;
 
@@ -717,14 +774,18 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 			/* Invalid username/password; reuse same form, but blank,
 			 * unless we just did a blind retry.
 			 */
-			nuke_opt_values(ctx->form->opts);
+			if (ctx->form)
+				nuke_opt_values(ctx->form->opts);
+			else
+				blind_retry = 0;
+
 			if (!blind_retry)
 				goto got_form;
 			else
 				blind_retry = 0;
 		} else {
 			/* Save successful username */
-			if (!ctx->username)
+			if (!ctx->username && ctx->form && ctx->form->opts->_value)
 				ctx->username = strdup(ctx->form->opts->_value);
 			if (result == -EAGAIN) {
 				/* New form is already populated from the challenge */
@@ -736,7 +797,7 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 				 */
 				portal = 0;
 				if (ctx->portal_userauthcookie || ctx->portal_prelogonuserauthcookie ||
-				    (strcmp(ctx->form->auth_id, "_challenge") && !ctx->alt_secret)) {
+				    (ctx->form &&(strcmp(ctx->form->auth_id, "_challenge")) && !ctx->alt_secret)) {
 					blind_retry = 1;
 					goto replay_form;
 				}
@@ -838,4 +899,234 @@ out:
 	buf_free(request_body);
 	free(xml_buf);
 	return result;
+}
+
+static int parse_callback_file (struct openconnect_info *vpninfo, const char *data_file)
+{
+	FILE *fptr;
+	char *data;
+	int len;
+	void *xml = NULL;
+	xmlDocPtr xml_doc;
+	xmlNode *xml_node;
+	char *comment = NULL;
+	char *prelogin_cookie = NULL;
+	char *saml_username = NULL;
+	int size;
+
+	/* Open callback data file */
+	fptr = fopen(data_file, "r");
+	if (!fptr) {
+		vpn_progress(vpninfo, PRG_INFO, "Failed to open file %s\n", data_file);
+		return -1;
+	}
+
+	/* Get file size */
+	fseek(fptr, 0L, SEEK_END);
+	size = ftell(fptr);
+	fseek(fptr, 0L, SEEK_SET);
+
+	/* Read data */
+	data = malloc(size + 1);
+	memset(data, 0, size + 1);
+	fread(data, size, 1, fptr);
+	fclose(fptr);
+
+	if (strstr(data, "cas-as%3D")) {
+		char *token = strstr (data, "token%3D");
+		char *un = strstr (data, "un%3D");
+
+		if (!token || !un) {
+			free(data);
+			return -1;
+		}
+
+		vpn_progress(vpninfo, PRG_INFO, "CAS method for user %s\n", un);
+
+		saml_username = malloc (token - un);
+		if (saml_username) {
+			strncpy(saml_username, un + 5, token - un - 5 - 3);
+			free(vpninfo->sso_username);
+			vpninfo->sso_username = saml_username;
+		}
+
+		vpninfo->sso_token_cookie = strdup(token + 8);
+		free(data);
+
+		return 0;
+	}
+
+	vpn_progress(vpninfo, PRG_INFO, "Token method\n");
+
+	xml = openconnect_base64_decode (&len, data);
+	free(data);
+
+	vpn_progress(vpninfo, PRG_INFO, "xml (%d): %s\n", len, (char*)xml);
+
+	xml_doc = xmlReadMemory((char*)xml, len, NULL, NULL, XML_PARSE_NOERROR|XML_PARSE_RECOVER);
+	free(xml);
+
+	xml_node = xmlDocGetRootElement(xml_doc);
+	if (!xml_node)
+		return -1;
+
+	for (xmlNode *x = xml_node->children; x; x = x->next) {
+		/* Weird protocol response...
+		 * <html>
+		 *	<!-- <saml-auth-status>1</saml-auth-status>       // Authentication Status 1 = OK
+		 *	<prelogin-cookie>TOKEN</prelogin-cookie>          // Prelogin Cookie
+		 *	<saml-username>NAME</saml-username>               // Username
+		 * 	<saml-slo>no</saml-slo>                           // SAML Single Log-Out (SLO)
+		 *	<saml-SessionNotOnOrAfter>2023-11-18T03:13:37.368Z</saml-SessionNotOnOrAfter> // Session Lifetime, used for reconnect
+		 * -></html>
+		 */
+		if (!xmlnode_get_val(x, "comment", &comment)) {
+			/* Create a parent xml node for parsing */
+			char *buf = malloc(strlen("<parent>") + strlen(comment) + strlen("</parent>"));
+
+			strcpy(buf, "<parent>");
+			strcat(buf, comment);
+			strcat(buf, "</parent>");
+
+			xmlDocPtr xml2_doc = xmlReadMemory((char*)buf, strlen(buf), NULL, NULL, XML_PARSE_NOERROR|XML_PARSE_RECOVER);
+			free(buf);
+			xmlNode *xml2_node = xmlDocGetRootElement(xml2_doc);
+
+			for (xmlNode *y = xml2_node->children; y; y = y->next) {
+				vpn_progress(vpninfo, PRG_DEBUG, "-> Got node: %s\n", y->name);
+				xmlnode_get_val(y, "prelogin-cookie", &prelogin_cookie);
+				xmlnode_get_val(y, "saml-username", &saml_username);
+			}
+			xmlFreeDoc(xml2_doc);
+		}
+	}
+
+	if (saml_username) {
+		vpn_progress(vpninfo, PRG_INFO, "saml_username: %s\n", saml_username);
+		free(vpninfo->sso_username);
+		vpninfo->sso_username = strdup(saml_username);
+	}
+
+	if (prelogin_cookie) {
+		vpn_progress(vpninfo, PRG_INFO, "prelogin_cookie: %s\n", prelogin_cookie);
+		free(vpninfo->sso_token_cookie);
+		free(vpninfo->sso_cookie_value);
+		vpninfo->sso_token_cookie = strdup("prelogin_cookie");
+		vpninfo->sso_cookie_value = strdup(prelogin_cookie);
+	}
+
+	return 0;
+}
+
+int gpst_handle_external_browser(struct openconnect_info *vpninfo)
+{
+	int ret = -1;
+	char *data_file = NULL;
+	char *uri = NULL;
+	char *oc_cache_dir = NULL;
+	int data_file_len;
+
+	oc_cache_dir = get_user_cache_dir ();
+
+	/* Create data */
+	data_file_len = strlen (oc_cache_dir) + 1 + strlen(GP_DATA_FILE) + 1;
+	data_file = malloc(data_file_len);
+	strcpy(data_file, oc_cache_dir);
+	strcat(data_file, "/");
+	strcat(data_file, GP_DATA_FILE);
+
+	/* Check whether the sso_login is actually a data field */
+	if (strlen(vpninfo->sso_login) > 22 && strncmp(vpninfo->sso_login, "data:text/html;base64,", 22) == 0) {
+		int len;
+		void *out = openconnect_base64_decode(&len, vpninfo->sso_login + 22);
+		char *tmp_file;
+		FILE *file;
+		int tmp_file_len;
+
+		vpn_progress(vpninfo, PRG_INFO, "data: %s\n", vpninfo->sso_login);
+		if (!out)
+			goto finish;
+
+		tmp_file_len = strlen(oc_cache_dir) + strlen("/saml.html") + 1;
+		tmp_file = malloc(tmp_file_len);
+		strcpy(tmp_file, oc_cache_dir);
+		strcat(tmp_file, "/saml.html");
+		file = fopen(tmp_file, "w");
+		fwrite((char*)out, 1, len, file);
+		fclose(file);
+
+		free(out);
+
+		uri = malloc(strlen("file:///") + strlen(tmp_file) + 1);
+		strcpy(uri, "file:///");
+		strcat(uri, tmp_file);
+		free(tmp_file);
+	} else {
+		uri = strdup(vpninfo->sso_login);
+	}
+
+#ifndef _WIN32
+	int fd, wd;
+
+	fd = inotify_init();
+	if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
+		goto finish;
+
+	wd = inotify_add_watch(fd, oc_cache_dir, IN_CLOSE_WRITE);
+	if (wd == -1) {
+		vpn_progress(vpninfo, PRG_DEBUG, "Could not watch : %s\n", oc_cache_dir);
+	} else {
+		vpn_progress(vpninfo, PRG_DEBUG, "Watching : %s\n", oc_cache_dir);
+	}
+
+	if (vpninfo->open_ext_browser) {
+		ret = vpninfo->open_ext_browser(vpninfo, uri, vpninfo->cbdata);
+	} else {
+		ret = -EINVAL;
+	}
+
+	if (ret) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to spawn external browser for %s\n"),
+			     vpninfo->sso_login);
+		goto finish;
+	}
+
+	/* TODO: Add timeout check to prevent lock up */
+	 while (1) {
+		int i = 0, length;
+		char buffer[BUF_LEN];
+
+		length = read(fd, buffer, BUF_LEN);
+
+		while (i < length) {
+ 			struct inotify_event *event = (struct inotify_event *) &buffer[i];
+
+			if (event->len) {
+				if ((event->mask & IN_CLOSE_WRITE) && !(event->mask & IN_ISDIR) && strcmp(event->name, GP_DATA_FILE) == 0) {
+					vpn_progress(vpninfo, PRG_INFO, "The file %s was written.\n", event->name);
+					ret = parse_callback_file (vpninfo, data_file);
+					goto finish;
+				}
+			}
+			i += EVENT_SIZE + event->len;
+		}
+	}
+#else
+	vpn_progress(vpninfo, PRG_INFO, "Proper callback data handling missing on Windows\n");
+	Sleep(10 * 1000);
+	ret = parse_callback_file (vpninfo, data_file);
+#endif
+
+finish:
+	if (uri)
+		free(uri);
+
+	if (oc_cache_dir)
+		free(oc_cache_dir);
+
+	if (data_file)
+		free(data_file);
+
+	return ret;
 }
