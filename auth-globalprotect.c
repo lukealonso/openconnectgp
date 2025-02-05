@@ -195,12 +195,6 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 					_("SAML %s authentication is required via %s\n"),
 					saml_method, saml_path);
 
-			/* Legacy flow (when not called by n-m-oc) */
-			if (!vpninfo->open_webview) {
-				vpn_progress(vpninfo,
-					PRG_ERR, _("When SAML authentication is complete, specify destination form field by appending :field_name to login URL.\n"));
-				goto out;
-			}
 		}
 	}
 
@@ -735,13 +729,13 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 
 		/* submit gateway login (ssl-vpn/login.esp) or portal config (global-protect/getconfig.esp) request */
 		buf_truncate(request_body);
-		buf_append(request_body, "jnlpReady=jnlpReady&ok=Login&direct=yes&clientVer=4100&prot=https:&internal=no");
+		buf_append(request_body, "jnlpReady=jnlpReady&ok=Login&direct=yes&clientVer=4100&prot=https:");
 		append_opt(request_body, "ipv6-support", vpninfo->disable_ipv6 ? "no" : "yes");
 		append_opt(request_body, "clientos", gpst_os_name(vpninfo));
 		append_opt(request_body, "os-version", vpninfo->platname);
 		append_opt(request_body, "server", vpninfo->hostname);
 		append_opt(request_body, "computer", vpninfo->localname);
-		if (ctx->cas_auth && vpninfo->sso_token_cookie)
+		if (portal && ctx->cas_auth && vpninfo->sso_token_cookie)
 			append_opt(request_body, "token", vpninfo->sso_token_cookie);
 		if (ctx->portal_userauthcookie)
 			append_opt(request_body, "portal-userauthcookie", ctx->portal_userauthcookie);
@@ -932,9 +926,9 @@ static int parse_callback_file (struct openconnect_info *vpninfo, const char *da
 	fread(data, size, 1, fptr);
 	fclose(fptr);
 
-	if (strstr(data, "cas-as%3D")) {
-		char *token = strstr (data, "token%3D");
-		char *un = strstr (data, "un%3D");
+	if (strstr(data, "cas-as=")) {
+		char *token = strstr (data, "token=");
+		char *un = strstr (data, "un=");
 
 		if (!token || !un) {
 			free(data);
@@ -943,14 +937,16 @@ static int parse_callback_file (struct openconnect_info *vpninfo, const char *da
 
 		vpn_progress(vpninfo, PRG_INFO, "CAS method for user %s\n", un);
 
-		saml_username = malloc (token - un);
+		saml_username = malloc ((token - un) + 16);
 		if (saml_username) {
-			strncpy(saml_username, un + 5, token - un - 5 - 3);
+			int namelen = token - un - 4;
+			memcpy(saml_username, un + 3, namelen);
+			saml_username[namelen] = 0;
 			free(vpninfo->sso_username);
 			vpninfo->sso_username = saml_username;
 		}
 
-		vpninfo->sso_token_cookie = strdup(token + 8);
+		vpninfo->sso_token_cookie = strdup(token + 6);
 		free(data);
 
 		return 0;
@@ -1082,7 +1078,11 @@ int gpst_handle_external_browser(struct openconnect_info *vpninfo)
 	if (vpninfo->open_ext_browser) {
 		ret = vpninfo->open_ext_browser(vpninfo, uri, vpninfo->cbdata);
 	} else {
-		ret = -EINVAL;
+		// The open_ext_browser hook is only used in very recent nm-oc versions, so provide
+		// a fallback here rather than failing.
+		char spawn[512];
+		sprintf(spawn, "xdg-open \"%s\"&", uri);
+		ret = system(spawn);
 	}
 
 	if (ret) {

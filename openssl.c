@@ -1930,6 +1930,10 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
 			 * Current versions of the Cisco ASA doesn't seem to cope */
 			SSL_CTX_set_options(vpninfo->https_ctx, SSL_OP_LEGACY_SERVER_CONNECT);
 		}
+
+		if ((vpninfo->proto->flags & OC_PROTO_FORCE_LEGACY_CONNECT) != 0) {
+			SSL_CTX_set_options(vpninfo->https_ctx, SSL_OP_LEGACY_SERVER_CONNECT);
+		}
 #endif
 
 		if (vpninfo->certinfo[0].cert) {

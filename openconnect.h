@@ -206,6 +206,7 @@ extern "C" {
 #define OC_PROTO_PERIODIC_TROJAN	(1<<5)
 #define OC_PROTO_HIDDEN	(1<<6)
 #define OC_PROTO_AUTH_MCA	(1<<7)
+#define OC_PROTO_FORCE_LEGACY_CONNECT	(1<<8)
 
 struct oc_vpn_proto {
 	const char *name;
